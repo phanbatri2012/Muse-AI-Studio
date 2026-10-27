@@ -14,7 +14,11 @@ ROOT = Path(__file__).resolve().parent.parent
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from qt_ui.tab_accounts_manager import AccountsManagerTab, BatchLoginWorker
+from qt_ui.tab_accounts_manager import (
+    AccountsManagerTab,
+    BatchLoginWorker,
+    parse_account_login_line,
+)
 
 
 @pytest.fixture(scope="session")
@@ -44,3 +48,30 @@ def test_batch_login_parsing():
 
     worker = BatchLoginWorker(raw_lines)
     assert len(worker.account_lines) == 6
+
+
+def test_parse_account_login_line_supports_password_and_mailbox_url():
+    assert parse_account_login_line("user@example.com|pass|ABC123") == (
+        "user@example.com",
+        "pass",
+        "ABC123",
+        "",
+    )
+    assert parse_account_login_line(
+        "user@tuan89.site|https://tuan89.site/mail/?email=user%40tuan89.site"
+    ) == (
+        "user@tuan89.site",
+        "",
+        "",
+        "https://tuan89.site/mail/?email=user%40tuan89.site",
+    )
+
+
+def test_parse_account_login_line_unwraps_markdown_mailbox_url():
+    line = (
+        "user@tuan89.site|"
+        "[Mở hộp thư](https://tuan89.site/mail/?email=user%40tuan89.site)"
+    )
+    assert parse_account_login_line(line)[3] == (
+        "https://tuan89.site/mail/?email=user%40tuan89.site"
+    )

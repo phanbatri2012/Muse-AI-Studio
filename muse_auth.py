@@ -7,9 +7,11 @@ import hashlib
 import hmac
 import json
 import os
+import re
 import struct
 import time
 from pathlib import Path
+from urllib.parse import parse_qs, urlsplit
 try:
     from playwright.async_api import Browser, BrowserContext, Page, Playwright, async_playwright
 except ImportError:
@@ -32,6 +34,19 @@ def generate_totp_code(secret: str) -> str:
     offset = digest[-1] & 0x0F
     code = struct.unpack(">I", digest[offset:offset+4])[0] & 0x7FFFFFFF
     return f"{code % 1000000:06d}"
+
+
+def validate_tuan89_mailbox_url(email: str, mailbox_url: str) -> str:
+    """Validate a Tuan89 mailbox capability URL and return its HTTPS origin."""
+    parsed = urlsplit(mailbox_url.strip())
+    if parsed.scheme.lower() != "https" or parsed.hostname != "tuan89.site":
+        raise ValueError("Link hộp thư phải dùng HTTPS trên tuan89.site.")
+    if parsed.username or parsed.password or parsed.port is not None:
+        raise ValueError("Link hộp thư không hợp lệ.")
+    mailbox_email = (parse_qs(parsed.query).get("email") or [""])[0].strip()
+    if mailbox_email.casefold() != email.strip().casefold():
+        raise ValueError("Email trong link hộp thư không khớp tài khoản.")
+    return "https://tuan89.site"
 
 
 from runtime_bootstrap import ensure_chrome_available, resolve_browser_executable
@@ -792,6 +807,7 @@ class MuseAuthManager:
         email: str,
         password: str,
         two_factor_secret: str | None = None,
+        mailbox_url: str | None = None,
         timeout_seconds: int = 60,
         log_callback: Callable[[str], None] | None = None,
     ) -> dict[str, Any]:
@@ -799,6 +815,7 @@ class MuseAuthManager:
         Hỗ trợ:
         - Nhập Email và nhấn Tiếp tục
         - Chọn 'Use password instead' và nhập Mật khẩu
+        - Hoặc nhận mã đăng nhập từ link hộp thư Tuan89
         - Tự động chọn hồ sơ Meta Account đầu tiên nếu xuất hiện màn hình chọn hồ sơ
         - Tự động vượt qua 2FA TOTP với secret key Base32
         - Chờ cấp phát session cookies (hatch_sess, hatch_vml, hatch_gw)
@@ -835,6 +852,24 @@ class MuseAuthManager:
             )
             page = await context.new_page()
 
+            mailbox_origin = ""
+            baseline_message_ids: set[str] = set()
+            if mailbox_url:
+                mailbox_origin = validate_tuan89_mailbox_url(email, mailbox_url)
+                baseline_response = await context.request.get(
+                    f"{mailbox_origin}/api/temp-mail/inbox",
+                    params={"email": email},
+                    timeout=10000,
+                )
+                baseline_data = await baseline_response.json()
+                if not baseline_response.ok or not baseline_data.get("success"):
+                    raise RuntimeError("Không thể mở hộp thư nhận mã đăng nhập.")
+                baseline_message_ids = {
+                    str(item.get("id"))
+                    for item in baseline_data.get("messages", [])
+                    if item.get("id") is not None
+                }
+
             _log("🌐 Đang kết nối tới https://muse.ai/...", log_callback)
             await page.goto("https://muse.ai/", wait_until="networkidle", timeout=30000)
             await asyncio.sleep(2.0)
@@ -852,24 +887,74 @@ class MuseAuthManager:
             await cont_btn.click()
             await asyncio.sleep(3.5)
 
-            # 2. Click 'Use password instead' (nếu xuất hiện)
-            use_pwd = page.locator("button:has-text('Use password instead'), a:has-text('Use password instead')").first
-            if await use_pwd.count() > 0 and await use_pwd.is_visible():
-                _log("🔑 Chuyển sang nhập mật khẩu...", log_callback)
-                await use_pwd.click()
-                await asyncio.sleep(2.5)
-
-            # 3. Điền Password
-            pwd_input = page.locator("input[type='password']").first
-            if await pwd_input.count() > 0 and await pwd_input.is_visible():
-                _log("🔒 Đang điền mật khẩu...", log_callback)
-                await pwd_input.fill(password)
+            if mailbox_url:
+                _log("📨 Đang chờ mã đăng nhập mới từ hộp thư...", log_callback)
+                code_input = page.locator(
+                    "input[autocomplete='one-time-code'], input[placeholder*='code' i], "
+                    "input[maxlength='6'], input[name='code'], input[name='approvals_code']"
+                ).first
+                await code_input.wait_for(state="visible", timeout=15000)
+                mailbox_deadline = time.time() + float(timeout_seconds)
+                mailbox_code = ""
+                while time.time() < mailbox_deadline and not mailbox_code:
+                    response = await context.request.get(
+                        f"{mailbox_origin}/api/temp-mail/inbox",
+                        params={"email": email},
+                        timeout=10000,
+                    )
+                    data = await response.json()
+                    if response.ok and data.get("success"):
+                        for item in data.get("messages", []):
+                            message_id = str(item.get("id"))
+                            otp_code = str(item.get("otp_code") or "").strip()
+                            if (
+                                message_id not in baseline_message_ids
+                                and re.fullmatch(r"\d{4,8}", otp_code)
+                            ):
+                                mailbox_code = otp_code
+                                break
+                    if not mailbox_code:
+                        await asyncio.sleep(2.0)
+                if not mailbox_code:
+                    raise TimeoutError("Không nhận được mã đăng nhập mới từ hộp thư.")
+                await code_input.fill(mailbox_code)
+                submit_code = page.locator(
+                    "button:has-text('Next'), button:has-text('Continue'), "
+                    "button:has-text('Confirm'), button[type='submit']"
+                ).first
                 await asyncio.sleep(1.0)
-                next_btn = page.locator("button:has-text('Next'), button[type='submit']").first
-                await next_btn.click()
-                await asyncio.sleep(4.5)
+                session_cookies = {item["name"]: item["value"] for item in await context.cookies()}
+                if not any(name in session_cookies for name in ("hatch_sess", "hatch_vml")):
+                    try:
+                        if (
+                            await submit_code.count() > 0
+                            and await submit_code.is_visible()
+                            and await submit_code.is_enabled()
+                        ):
+                            await submit_code.click(timeout=5000)
+                    except Exception:
+                        # Meta may auto-submit the OTP and replace the button during navigation.
+                        pass
+                await asyncio.sleep(3.5)
             else:
-                _log("⚠️ Không tìm thấy ô mật khẩu", log_callback)
+                # 2. Click 'Use password instead' (nếu xuất hiện)
+                use_pwd = page.locator("button:has-text('Use password instead'), a:has-text('Use password instead')").first
+                if await use_pwd.count() > 0 and await use_pwd.is_visible():
+                    _log("🔑 Chuyển sang nhập mật khẩu...", log_callback)
+                    await use_pwd.click()
+                    await asyncio.sleep(2.5)
+
+                # 3. Điền Password
+                pwd_input = page.locator("input[type='password']").first
+                if await pwd_input.count() > 0 and await pwd_input.is_visible():
+                    _log("🔒 Đang điền mật khẩu...", log_callback)
+                    await pwd_input.fill(password)
+                    await asyncio.sleep(1.0)
+                    next_btn = page.locator("button:has-text('Next'), button[type='submit']").first
+                    await next_btn.click()
+                    await asyncio.sleep(4.5)
+                else:
+                    _log("⚠️ Không tìm thấy ô mật khẩu", log_callback)
 
             # 4. Chọn hồ sơ Meta Account nếu có màn hình chọn
             acc_btn = page.locator("button[data-pel-click='login_account_selection_row_click'], button:has-text('Meta Account')").first

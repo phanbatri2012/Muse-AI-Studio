@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import re
 import threading
 import time
 from pathlib import Path
@@ -50,6 +51,35 @@ from muse_service_manager import (
 from muse_api_client import MuseAPIClient
 
 
+_MARKDOWN_LINK_RE = re.compile(r"^\[[^\]]*\]\((https?://[^)]+)\)$", re.IGNORECASE)
+
+
+def parse_account_login_line(line: str) -> tuple[str, str, str, str]:
+    """Parse legacy password credentials or an email mailbox link."""
+    value = line.strip()
+    if not value:
+        raise ValueError("Dòng tài khoản trống.")
+
+    if "|" in value:
+        parts = [part.strip() for part in value.split("|")]
+    elif "\t" in value:
+        parts = [part.strip() for part in value.split("\t")]
+    else:
+        parts = [part.strip() for part in value.split(",")]
+    if len(parts) < 2 or not parts[0] or not parts[1]:
+        raise ValueError("Cần nhập email và mật khẩu hoặc link hộp thư.")
+
+    email = parts[0]
+    second = parts[1]
+    markdown_match = _MARKDOWN_LINK_RE.fullmatch(second)
+    mailbox_url = markdown_match.group(1) if markdown_match else second
+    if mailbox_url.lower().startswith(("https://", "http://")):
+        return email, "", "", mailbox_url
+
+    two_factor_secret = parts[2] if len(parts) >= 3 else ""
+    return email, second, two_factor_secret, ""
+
+
 class BatchLoginWorker(QThread):
     """Thread chạy nền xử lý đăng nhập tuần tự cho danh sách tài khoản."""
 
@@ -81,16 +111,12 @@ class BatchLoginWorker(QThread):
             if not s or s.startswith("#"):
                 continue
 
-            # Phân tách email|password|2fa (hỗ trợ dấu |, dấu phẩy, tab)
-            parts = [p.strip() for p in s.replace(",", "|").replace("\t", "|").split("|") if p.strip()]
-            if len(parts) < 2:
-                self.log_signal.emit(f"⚠️ Bỏ qua dòng không đúng định dạng: {s}")
+            try:
+                email, password, two_fa, mailbox_url = parse_account_login_line(s)
+            except ValueError as exc:
+                self.log_signal.emit(f"⚠️ Bỏ qua dòng {idx}: {exc}")
                 fail_count += 1
                 continue
-
-            email = parts[0]
-            password = parts[1]
-            two_fa = parts[2] if len(parts) >= 3 else ""
 
             self.progress_signal.emit(idx, total, email, f"Đang đăng nhập ({idx}/{total})...")
             self.log_signal.emit(f"[{idx}/{total}] 🔑 Đang đăng nhập tài khoản: {email}...")
@@ -101,6 +127,7 @@ class BatchLoginWorker(QThread):
                         email=email,
                         password=password,
                         two_factor_secret=two_fa,
+                        mailbox_url=mailbox_url or None,
                         timeout_seconds=60,
                         log_callback=self.log_signal.emit,
                     )
@@ -118,7 +145,7 @@ class BatchLoginWorker(QThread):
 
             except Exception as exc:
                 fail_count += 1
-            self.log_signal.emit(f"❌ Ngoại lệ khi đăng nhập ({email}): {exc}")
+                self.log_signal.emit(f"❌ Ngoại lệ khi đăng nhập ({email}): {exc}")
 
             time.sleep(1.0)
 
@@ -359,7 +386,10 @@ class AccountsManagerTab(QWidget):
         left_layout.addWidget(btn_buy_fast)
 
         # Hướng dẫn nhanh cho người dùng non-tech
-        lbl_hint = QLabel("💡 <b>Cú pháp mỗi dòng:</b> <code>email | mật_khẩu | mã_2fa</code>")
+        lbl_hint = QLabel(
+            "💡 <b>Dạng 1:</b> <code>email | mật_khẩu | mã_2fa</code><br>"
+            "💡 <b>Dạng 2:</b> <code>email | link_hộp_thư</code>"
+        )
         lbl_hint.setStyleSheet("color: #94a3b8; font-size: 11px;")
         left_layout.addWidget(lbl_hint)
 
@@ -368,7 +398,7 @@ class AccountsManagerTab(QWidget):
         self.txt_accounts_input.setPlaceholderText(
             "Dán danh sách tài khoản tại đây, mỗi dòng một tài khoản:\n\n"
             "user1@example.com|Password123|JBSWY3DPEHPK3PXP\n"
-            "user2@example.com|Password456|JBSWY3DPEHPK3PXP\n"
+            "user2@tuan89.site|https://tuan89.site/mail/?email=user2%40tuan89.site\n"
         )
         self.txt_accounts_input.setLineWrapMode(QPlainTextEdit.LineWrapMode.NoWrap)
         font = QFont("Consolas", 11)
