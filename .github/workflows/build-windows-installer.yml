@@ -1,0 +1,56 @@
+name: Build Windows Installer
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+      - codex/windows-installer-*
+    paths:
+      - "run_veo_4.0.py"
+      - "main.py"
+      - "License.py"
+      - "settings_manager.py"
+      - "runtime_*.py"
+      - "qt_ui/**"
+      - "installer/**"
+      - "scripts/build_windows.*"
+      - "requirements-windows.txt"
+      - "tool_veo_promax.spec"
+
+jobs:
+  build-installer:
+    runs-on: windows-latest
+    timeout-minutes: 60
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          architecture: "x64"
+
+      - name: Install Inno Setup
+        shell: powershell
+        run: choco install innosetup --no-progress -y
+
+      - name: Build Windows installer
+        shell: powershell
+        run: .\scripts\build_windows.ps1
+
+      - name: Upload installer artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: TOOL_VEO_PROMAX_Setup
+          path: dist-installer/TOOL_VEO_PROMAX_Setup.exe
+          if-no-files-found: error
+
+      - name: Upload app bundle artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: TOOL_VEO_PROMAX_bundle
+          path: dist/TOOL VEO PROMAX/**
+          if-no-files-found: error

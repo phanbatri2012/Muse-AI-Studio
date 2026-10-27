@@ -1,0 +1,97 @@
+__pycache__/
+*.py[cod]
+.DS_Store
+.venv312/
+.venv-winbuild/
+/Workflows/
+chrome_user_data/
+chrome_user_data_grok/
+data_general/
+downloads/
+build/
+dist/
+dist-installer/
+build-assets/windows/bin/*.exe
+build-assets/windows/prereqs/*.exe
+CLAUDE.local.md
+.claude/settings.local.json
+
+# Local secrets and personal/runtime data (never commit)
+.env
+.env.*
+!.env.example
+/License.py
+/data/
+/data_general/
+/runtime/
+/muse2api_data/
+/chrome_user_data/
+/chrome_user_data_grok/
+/downloads/
+*.db
+*.sqlite
+*.sqlite3
+*.log
+*.cookie*
+*.session*
+
+# User-provided BGM is local-only
+/ah_bgm/*
+!/ah_bgm/README.md
+
+# Mac copy duplicates ("file 2.py", "folder 2/")
+* 2.*
+* 2/
+
+# Standard venv
+.venv/
+rotation_log.txt
+
+# Local temporary and state files
+*.lnk
+*.bak
+*.backup*
+_debug_flow.png
+pipeline_watch_config.json
+pipeline_watch_state*.json
+*.pid
+.tool.pid
+output/
+muse2api_backend/data/
+test_assets/
+# Legacy VEO & Grok files (excluded from Muse AI Studio repository)
+veo_client.py
+run_veo_4.0.py
+launch-run-veo.ps1
+tool_veo_promax.spec
+tool_veo_promax_mac.spec
+installer/windows/tool_veo_promax.iss
+RUN_TOOL.bat
+WINDOWS_BUILD.md
+API_Create_image.py
+API_image_to_image.py
+API_image_to_video.py
+API_sync_character.py
+API_text_to_video.py
+A_workflow_generate_image.py
+A_workflow_image_to_image.py
+A_workflow_image_to_video.py
+A_workflow_sync_character.py
+A_workflow_text_to_video.py
+A_workflow_get_token.py
+chrome.py
+chrome_process_manager.py
+login.py
+gas_backend.js
+generate_keys.py
+server.py
+web_ui/
+tools/
+run.command
+enable_auto_start.sh
+scripts/build_mac.sh
+scripts/merge-branch.sh
+scripts/publish_windows_release.sh
+scripts/run_gui_tests.sh
+create_shortcut.py
+create_shortcuts.ps1

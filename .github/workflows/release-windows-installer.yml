@@ -1,0 +1,38 @@
+name: Release Windows Installer
+
+on:
+  push:
+    tags:
+      - "v*"
+
+jobs:
+  release-installer:
+    runs-on: windows-latest
+    timeout-minutes: 60
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          architecture: "x64"
+
+      - name: Install Inno Setup
+        shell: powershell
+        run: choco install innosetup --no-progress -y
+
+      - name: Build Windows installer
+        shell: powershell
+        run: .\scripts\build_windows.ps1
+
+      - name: Create GitHub release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist-installer/TOOL_VEO_PROMAX_Setup.exe
+          generate_release_notes: true
