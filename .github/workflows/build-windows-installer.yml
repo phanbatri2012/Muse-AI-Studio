@@ -7,16 +7,16 @@ on:
       - main
       - codex/windows-installer-*
     paths:
-      - "run_veo_4.0.py"
       - "main.py"
-      - "License.py"
+      - "muse*.py"
+      - "muse2api_backend/**"
       - "settings_manager.py"
       - "runtime_*.py"
       - "qt_ui/**"
       - "installer/**"
       - "scripts/build_windows.*"
       - "requirements-windows.txt"
-      - "tool_veo_promax.spec"
+      - "Muse_AI_Studio.spec"
 
 jobs:
   build-installer:
@@ -44,13 +44,13 @@ jobs:
       - name: Upload installer artifact
         uses: actions/upload-artifact@v4
         with:
-          name: TOOL_VEO_PROMAX_Setup
-          path: dist-installer/TOOL_VEO_PROMAX_Setup.exe
+          name: Muse_AI_Studio_Setup
+          path: dist-installer/Muse_AI_Studio_Setup.exe
           if-no-files-found: error
 
       - name: Upload app bundle artifact
         uses: actions/upload-artifact@v4
         with:
-          name: TOOL_VEO_PROMAX_bundle
-          path: dist/TOOL VEO PROMAX/**
+          name: Muse_AI_Studio_bundle
+          path: dist/Muse AI Studio/**
           if-no-files-found: error
