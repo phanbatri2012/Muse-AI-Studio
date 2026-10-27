@@ -7,6 +7,7 @@ on:
       - main
       - codex/windows-installer-*
     paths:
+      - ".github/workflows/build-windows-installer.yml"
       - "main.py"
       - "muse*.py"
       - "muse2api_backend/**"
