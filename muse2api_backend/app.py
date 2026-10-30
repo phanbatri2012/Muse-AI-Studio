@@ -23,7 +23,7 @@ OpenAI 兼容:
 """
 from __future__ import annotations
 
-from typing import Any
+from typing import Any, Literal
 
 import asyncio
 import base64
@@ -43,6 +43,8 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.responses import (FileResponse, HTMLResponse, JSONResponse,
                                Response, StreamingResponse)
 from pydantic import BaseModel, Field
+
+from muse_auth import MuseAuthManager
 
 try:
     from config import CFG
@@ -69,6 +71,9 @@ CFG.ensure_dirs()
 MUSE2API_VERSION = "1.8.1"
 VIDEO_START_END_CAPABILITY_VERSION = 1
 TASK_RECOVERY_CAPABILITY_VERSION = 1 if CFG.task_recovery_enabled else 0
+ACCOUNT_RELOGIN_CAPABILITY_VERSION = 2
+ACCOUNT_RELOGIN_VERIFY_ATTEMPTS = 3
+ACCOUNT_RELOGIN_VERIFY_DELAY_SECONDS = 1.5
 RUNTIME_ID = uuid.uuid4().hex
 
 app = FastAPI(title="muse2api", version=MUSE2API_VERSION)
@@ -252,6 +257,12 @@ async def _http_exc(request: Request, exc: HTTPException):
 
 @app.exception_handler(RequestValidationError)
 async def _validation_exc(request: Request, exc: RequestValidationError):
+    if re.fullmatch(r"/admin/accounts/[^/]+/relogin", request.url.path):
+        return JSONResponse(
+            status_code=422,
+            content={"detail": "Dữ liệu đăng nhập lại không hợp lệ."},
+            headers={"Cache-Control": "no-store"},
+        )
     if request.url.path.startswith("/v1/"):
         return JSONResponse(status_code=422, content={"error": {
             "message": "请求参数校验失败：" + str(exc.errors())[:400],
@@ -536,6 +547,14 @@ class AccountRequest(BaseModel):
 class AccountPatch(BaseModel):
     label: str | None = None
     enabled: bool | None = None
+
+
+class AccountReloginRequest(BaseModel):
+    email: str = Field(min_length=3, max_length=320)
+    method: Literal["password", "mailbox"]
+    password: str = Field(default="", max_length=1024)
+    two_factor_secret: str = Field(default="", max_length=256)
+    mailbox_url: str = Field(default="", max_length=2048)
 
 
 # ------------------------- 提示词构造 -------------------------
@@ -1093,10 +1112,11 @@ def _run_generation_locked(prompt: str, kind: str, timeout: int,
                     quota_aware=True,
                     exclude_ids=attempted_ids,
                 )
-            except MuseQuotaError as exc:
+            except (MuseQuotaError, MuseAuthError) as exc:
                 last_exc = exc
                 break
-            except MuseGenerationError:
+            except MuseGenerationError as exc:
+                last_exc = exc
                 break
             log.info(
                 "【生图/视频自动切号】切换到备用账号 %s (%s) 重试...",
@@ -1216,13 +1236,25 @@ def _redact_task_text(value: Any, *, fallback: str = "Muse task failed") -> str:
 
 
 def _task_failure(exc: Exception) -> tuple[str, str, bool]:
-    if isinstance(exc, MuseQuotaError):
-        return "Muse media quota exhausted", "media_quota_exhausted", False
-    if isinstance(exc, MuseAuthError):
-        return "Muse authentication failed", "authentication_failed", False
+    msg = str(exc or "").strip()
+    lowered = msg.casefold()
+
+    if isinstance(exc, MuseQuotaError) or any(k in lowered for k in ("quota", "额度不足", "cạn hạn mức", "hết hạn mức", "out of credits", "token limit")):
+        return f"Muse media quota exhausted: {msg}" if msg else "Muse media quota exhausted", "media_quota_exhausted", False
+
+    if isinstance(exc, MuseAuthError) or any(k in lowered for k in ("auth", "login", "cookie", "session", "401", "重新登录", "đăng nhập lại", "không có tài khoản", "可用媒体账号", "没有可用账号")):
+        return f"Muse authentication failed: {msg}" if msg else "Muse authentication failed", "authentication_failed", False
+
+    if any(k in lowered for k in ("超时", "timeout", "timed out", "time out", "quá thời gian chờ")):
+        live_usable = [a for a in store.accounts if a.get("enabled", True) and a.get("cookies") and a.get("ok") is not False]
+        if not live_usable:
+            return "Muse authentication failed: Các tài khoản Muse cần đăng nhập lại (hết hạn session / cookie 401)", "authentication_failed", False
+        return f"Muse generation timeout: {msg}" if msg else "Muse generation timeout", "timeout", True
+
     if isinstance(exc, MuseGenerationError):
-        return "Muse generation failed", "generation_failed", False
-    return "Muse task failed", "generation_failed", False
+        return f"Muse generation failed: {msg}" if msg else "Muse generation failed", "generation_failed", False
+
+    return f"Muse task failed: {msg}" if msg else "Muse task failed", "generation_failed", False
 
 
 def _public_task(task: dict) -> dict:
@@ -1292,6 +1324,7 @@ def models(_=Depends(auth)):
         "capabilities": {
             "video_start_end_frames": VIDEO_START_END_CAPABILITY_VERSION,
             "task_recovery": TASK_RECOVERY_CAPABILITY_VERSION,
+            "account_relogin": ACCOUNT_RELOGIN_CAPABILITY_VERSION,
         },
     }
 
@@ -2141,8 +2174,182 @@ async def test_account(aid: str, _=Depends(auth)):
 
 
 @app.post("/admin/accounts/{aid}/relogin")
-async def relogin_account(aid: str, _=Depends(auth)):
-    return await test_account(aid, _)
+async def relogin_account(
+    aid: str,
+    payload: AccountReloginRequest,
+    _=Depends(auth),
+):
+    """Create and verify a fresh Muse session before replacing stored cookies."""
+
+    no_store = {"Cache-Control": "no-store"}
+    email = payload.email.strip()
+    password = payload.password
+    two_factor_secret = payload.two_factor_secret.strip()
+    mailbox_url = payload.mailbox_url.strip()
+    if not re.fullmatch(r"[^@\s]+@[^@\s]+\.[^@\s]+", email):
+        raise HTTPException(400, "Email Muse không hợp lệ.", headers=no_store)
+    if payload.method == "password":
+        if not password:
+            raise HTTPException(400, "Cần nhập mật khẩu Muse.", headers=no_store)
+        if mailbox_url:
+            raise HTTPException(400, "Không gửi link hộp thư khi dùng mật khẩu.", headers=no_store)
+    else:
+        if not mailbox_url:
+            raise HTTPException(400, "Cần nhập link hộp thư Tuan89.", headers=no_store)
+        if password or two_factor_secret:
+            raise HTTPException(400, "Không gửi mật khẩu hoặc 2FA khi dùng hộp thư.", headers=no_store)
+
+    account = store.get_account(aid)
+    if not account:
+        raise HTTPException(404, "Tài khoản Muse không tồn tại.", headers=no_store)
+    if _active_media_task_count() > 0:
+        raise HTTPException(409, "Muse đang tạo media; chưa thể đăng nhập lại.", headers=no_store)
+
+    account_acquired = False
+    browser_slots_acquired = 0
+    try:
+        try:
+            ACCOUNT_POOL.acquire(
+                account_id=aid,
+                timeout=0.1,
+                record_use=False,
+            )
+            account_acquired = True
+        except (MuseAuthError, MuseGenerationError) as exc:
+            raise HTTPException(
+                409,
+                "Tài khoản Muse đang bận hoặc đã bị tắt.",
+                headers=no_store,
+            ) from exc
+        for _slot in range(GEN_LOCK.limit):
+            if not GEN_LOCK.acquire(blocking=False):
+                raise HTTPException(409, "Trình duyệt Muse đang bận.", headers=no_store)
+            browser_slots_acquired += 1
+
+        result = await MuseAuthManager.login_standalone(
+            email=email,
+            password=password if payload.method == "password" else "",
+            two_factor_secret=(
+                two_factor_secret if payload.method == "password" else None
+            ),
+            mailbox_url=mailbox_url if payload.method == "mailbox" else None,
+            timeout_seconds=90,
+            log_callback=lambda _message: None,
+        )
+        if not result.get("success"):
+            error_code = str(result.get("error_code") or "login_failed")[:64]
+            log.warning(
+                "Muse account relogin failed account_id=%s error_code=%s",
+                aid,
+                error_code,
+            )
+            detail = {
+                "session_cookie_incomplete": (
+                    "Muse chưa cấp session hoàn chỉnh sau khi đăng nhập."
+                ),
+                "session_not_ready": (
+                    "Muse đã cấp cookie nhưng giao diện phiên chưa sẵn sàng."
+                ),
+                "mailbox_code_not_accepted": (
+                    "Meta chưa chấp nhận mã đăng nhập mới từ hộp thư."
+                ),
+                "session_bootstrap_revoked": (
+                    "Muse đã thu hồi session sau đăng nhập; tài khoản hoặc workspace "
+                    "chưa được kích hoạt."
+                ),
+            }.get(error_code, "Đăng nhập Muse thất bại; hãy kiểm tra lại thông tin.")
+            raise HTTPException(
+                401,
+                detail,
+                headers=no_store,
+            )
+
+        cookies = result.get("cookies")
+        cookies_exp = result.get("cookies_exp")
+        if not isinstance(cookies, dict) or not cookies:
+            raise HTTPException(
+                401,
+                "Muse không cấp session hợp lệ sau khi đăng nhập.",
+                headers=no_store,
+            )
+        if not isinstance(cookies_exp, dict):
+            cookies_exp = {}
+
+        def _verify_and_persist() -> dict:
+            engine.start()
+            for attempt in range(1, ACCOUNT_RELOGIN_VERIFY_ATTEMPTS + 1):
+                try:
+                    engine.refresh(cookies, cookies_exp)
+                    break
+                except MuseAuthError:
+                    if attempt >= ACCOUNT_RELOGIN_VERIFY_ATTEMPTS:
+                        raise
+                    engine.close_current_page()
+                    time.sleep(ACCOUNT_RELOGIN_VERIFY_DELAY_SECONDS)
+            now_ts = int(time.time())
+            updated = store.update_account(
+                aid,
+                cookies=cookies,
+                cookies_exp=cookies_exp,
+                expiry_anchor=now_ts,
+                login_email=email,
+                ok=True,
+                note="Đăng nhập lại thành công",
+                synced_at=now_ts,
+                checked_at=now_ts,
+                session_verified_at=now_ts,
+                verification_state="verified",
+            )
+            if not updated:
+                raise MuseAuthError("Account disappeared during relogin")
+            return updated
+
+        updated = await asyncio.to_thread(_verify_and_persist)
+        expiry = updated.get("expires_at")
+        has_real_vml_expiry = _pos(cookies_exp.get("hatch_vml"))
+        log.info("Muse account relogin succeeded account_id=%s", aid)
+        return JSONResponse(
+            content={
+                "ok": True,
+                "account": {
+                    "id": aid,
+                    "label": str(updated.get("label") or aid),
+                    "cookie_count": len(cookies),
+                    "session_ok": True,
+                    "is_expired": bool(expiry and float(expiry) <= time.time()),
+                    "expires_at": expiry,
+                    "expires_estimated": not has_real_vml_expiry,
+                    "session_verified_at": updated.get("session_verified_at"),
+                    "verification_state": "verified",
+                },
+            },
+            headers=no_store,
+        )
+    except HTTPException:
+        raise
+    except MuseAuthError as exc:
+        log.warning("Muse account relogin verification failed account_id=%s", aid)
+        raise HTTPException(
+            401,
+            "Đã đăng nhập nhưng phiên Muse chưa sẵn sàng sau bước xác minh.",
+            headers=no_store,
+        ) from exc
+    except Exception as exc:  # noqa: BLE001
+        log.warning(
+            "Muse account relogin error account_id=%s error_type=%s",
+            aid,
+            type(exc).__name__,
+        )
+        raise HTTPException(
+            502,
+            "Không thể hoàn tất đăng nhập lại Muse.",
+            headers=no_store,
+        ) from exc
+    finally:
+        for _slot in range(browser_slots_acquired):
+            GEN_LOCK.release()
+        if account_acquired:
+            ACCOUNT_POOL.release(aid)
 
 
 @app.post("/admin/accounts/{aid}/cookies")

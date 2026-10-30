@@ -168,6 +168,7 @@ class BatchLoginWorker(QThread):
             cookies_exp = login_res.get("cookies_exp", {})
             expires_at = login_res.get("expires_at", int(time.time() + 2 * 86400))
             now_ts = int(time.time())
+            session_verified_at = int(login_res.get("session_verified_at") or now_ts)
 
             # Tìm xem đã có tài khoản này chưa
             found = False
@@ -179,6 +180,10 @@ class BatchLoginWorker(QThread):
                     acc["enabled"] = True
                     acc["ok"] = True
                     acc["synced_at"] = now_ts
+                    acc["checked_at"] = now_ts
+                    acc["session_verified_at"] = session_verified_at
+                    acc["verification_state"] = "verified"
+                    acc["expires_estimated"] = bool(login_res.get("expires_estimated"))
                     found = True
                     break
 
@@ -198,6 +203,10 @@ class BatchLoginWorker(QThread):
                     "ok": True,
                     "note": f"Added via Accounts Manager on {time.strftime('%Y-%m-%d %H:%M')}",
                     "synced_at": now_ts,
+                    "checked_at": now_ts,
+                    "session_verified_at": session_verified_at,
+                    "verification_state": "verified",
+                    "expires_estimated": bool(login_res.get("expires_estimated")),
                 }
                 accounts.append(new_acc)
 

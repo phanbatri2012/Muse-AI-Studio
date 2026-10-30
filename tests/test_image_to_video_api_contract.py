@@ -83,7 +83,11 @@ class MuseStartEndFrameContractTests(unittest.TestCase):
 
         self.assertEqual(
             capability,
-            {"video_start_end_frames": 1, "task_recovery": 0},
+            {
+                "video_start_end_frames": 1,
+                "task_recovery": 0,
+                "account_relogin": 2,
+            },
         )
         serialized = json.dumps(capability).casefold()
         for sensitive_name in ("token", "cookie", "path", "password"):

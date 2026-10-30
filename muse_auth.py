@@ -11,6 +11,7 @@ import re
 import struct
 import time
 from pathlib import Path
+from typing import Any, Callable
 from urllib.parse import parse_qs, urlsplit
 try:
     from playwright.async_api import Browser, BrowserContext, Page, Playwright, async_playwright
@@ -82,6 +83,23 @@ AUTH_COOKIE_KEYWORDS = [
     "sb",
     "user_id",
 ]
+
+REQUIRED_MUSE_SESSION_COOKIES = frozenset({"hatch_sess", "hatch_vml"})
+
+
+def has_complete_muse_session(cookies: dict[str, str]) -> bool:
+    """Return true only after Muse has issued the canonical session pair."""
+
+    return all(
+        str(cookies.get(name) or "").strip()
+        for name in REQUIRED_MUSE_SESSION_COOKIES
+    )
+
+
+def has_muse_session_bootstrap(cookies: dict[str, str]) -> bool:
+    """Return true once Muse has issued the cookie needed to open the workspace."""
+
+    return bool(str(cookies.get("hatch_sess") or "").strip())
 
 
 def _log(message: str, logger: Callable[[str], None] | None = None) -> None:
@@ -979,7 +997,7 @@ class MuseAuthManager:
                 ).first
                 if await code_input.count() > 0 and await code_input.is_visible():
                     totp = generate_totp_code(two_factor_secret)
-                    _log(f"🔢 Nhập mã 2FA TOTP tự động: {totp}...", log_callback)
+                    _log("🔢 Đang nhập mã 2FA TOTP tự động...", log_callback)
                     await code_input.fill(totp)
                     await asyncio.sleep(1.0)
                     sub_2fa = page.locator("button:has-text('Next'), button:has-text('Continue'), button:has-text('Confirm'), button[type='submit']").first
@@ -990,18 +1008,148 @@ class MuseAuthManager:
             deadline = time.time() + float(timeout_seconds)
             cookies = []
             cookie_dict = {}
+            authenticated = False
+            bootstrap_cookie_seen = False
+            bootstrap_cookie_seen_at = 0.0
+            bootstrap_cookie_last_seen_at = 0.0
+            bootstrap_cookie_revoked = False
+            verification_deferred = False
+            verification_navigation_attempted = False
+            account_selection_handled = False
+            post_login_confirmation_handled = False
 
             while time.time() < deadline:
                 await asyncio.sleep(2.0)
                 cookies = await context.cookies()
                 cookie_dict = {c["name"]: c["value"] for c in cookies}
-                if any(k in cookie_dict for k in ["hatch_sess", "hatch_vml"]):
-                    _log("🎉 Đã nhận được session cookies thành công!", log_callback)
+                bootstrap_cookie_present = has_muse_session_bootstrap(cookie_dict)
+                if bootstrap_cookie_present:
+                    if not bootstrap_cookie_seen:
+                        bootstrap_cookie_seen_at = time.time()
+                    bootstrap_cookie_seen = True
+                    bootstrap_cookie_last_seen_at = time.time()
+                elif (
+                    bootstrap_cookie_seen
+                    and time.time() - bootstrap_cookie_last_seen_at >= 6.0
+                ):
+                    bootstrap_cookie_revoked = True
+                    break
+                if not bootstrap_cookie_seen:
+                    delayed_account = page.locator(
+                        "button[data-pel-click='login_account_selection_row_click'], "
+                        "button[data-pel-click*='account_selection']"
+                    ).first
+                    if (
+                        not account_selection_handled
+                        and await delayed_account.count() > 0
+                        and await delayed_account.is_visible()
+                        and await delayed_account.is_enabled()
+                    ):
+                        account_selection_handled = True
+                        _log(
+                            "👤 Đã phát hiện hồ sơ xuất hiện muộn; đang chọn hồ sơ...",
+                            log_callback,
+                        )
+                        await delayed_account.click(timeout=5000)
+                        continue
+
+                    delayed_code_input = page.locator(
+                        "input[autocomplete='one-time-code'], "
+                        "input[placeholder*='code' i], input[maxlength='6'], "
+                        "input[name='code'], input[name='approvals_code']"
+                    ).first
+                    code_input_visible = (
+                        await delayed_code_input.count() > 0
+                        and await delayed_code_input.is_visible()
+                    )
+                    delayed_confirmation = page.locator(
+                        "button:has-text('Continue'), button:has-text('Next'), "
+                        "button:has-text('Confirm')"
+                    ).first
+                    if (
+                        not code_input_visible
+                        and not post_login_confirmation_handled
+                        and await delayed_confirmation.count() > 0
+                        and await delayed_confirmation.is_visible()
+                        and await delayed_confirmation.is_enabled()
+                    ):
+                        post_login_confirmation_handled = True
+                        _log(
+                            "➡️ Đang xác nhận bước chuyển tiếp sau đăng nhập...",
+                            log_callback,
+                        )
+                        await delayed_confirmation.click(timeout=5000)
+                        continue
+                if bootstrap_cookie_seen and not verification_navigation_attempted:
+                    verification_navigation_attempted = True
+                    _log(
+                        "🔄 Đã nhận cookie bootstrap; đang mở workspace Muse...",
+                        log_callback,
+                    )
+                    try:
+                        await page.goto(
+                            "https://muse.ai/thread/new",
+                            wait_until="domcontentloaded",
+                            timeout=15000,
+                        )
+                    except Exception:
+                        # The next poll determines readiness from cookies and DOM.
+                        pass
+                    continue
+                if not bootstrap_cookie_seen:
+                    continue
+                if not bootstrap_cookie_present:
+                    continue
+
+                auth_state = await cls.check_authentication(page)
+                if auth_state.get("authenticated"):
+                    authenticated = True
+                    _log("🎉 Phiên Muse đã được xác minh thành công!", log_callback)
+                    break
+                if time.time() - bootstrap_cookie_seen_at >= 15.0:
+                    verification_deferred = True
+                    _log(
+                        "🔎 Đã nhận session bootstrap; chuyển sang verifier engine...",
+                        log_callback,
+                    )
                     break
 
-            if not any(k in cookie_dict for k in ["hatch_sess", "hatch_vml"]):
-                _log("❌ Hết thời gian chờ cấp session cookies", log_callback)
-                return {"success": False, "error": "Không nhận được session cookies sau khi đăng nhập", "email": email}
+            if not authenticated:
+                if bootstrap_cookie_revoked:
+                    _log("❌ Muse đã thu hồi session bootstrap", log_callback)
+                    return {
+                        "success": False,
+                        "error_code": "session_bootstrap_revoked",
+                        "error": "Muse đã thu hồi session ngay sau đăng nhập.",
+                        "email": email,
+                    }
+                if bootstrap_cookie_seen and not verification_deferred:
+                    verification_deferred = True
+                if mailbox_url and not verification_deferred:
+                    pending_code_input = page.locator(
+                        "input[autocomplete='one-time-code'], "
+                        "input[placeholder*='code' i], input[maxlength='6'], "
+                        "input[name='code'], input[name='approvals_code']"
+                    ).first
+                    if (
+                        await pending_code_input.count() > 0
+                        and await pending_code_input.is_visible()
+                    ):
+                        _log("❌ Mã hộp thư chưa được Meta chấp nhận", log_callback)
+                        return {
+                            "success": False,
+                            "error_code": "mailbox_code_not_accepted",
+                            "error": "Mã đăng nhập từ hộp thư chưa được chấp nhận.",
+                            "email": email,
+                        }
+                if not verification_deferred:
+                    _log("❌ Hết thời gian chờ session cookies hoàn chỉnh", log_callback)
+                    return {
+                        "success": False,
+                        "error_code": "session_cookie_incomplete",
+                        "error": "Muse chưa cấp session cookies hoàn chỉnh sau khi đăng nhập.",
+                        "email": email,
+                    }
 
             # Trích xuất hạn cookie
             cookies_exp = {}
@@ -1025,6 +1173,11 @@ class MuseAuthManager:
                 "cookies_list": cookies,
                 "cookies_exp": cookies_exp,
                 "expires_at": vml_exp,
+                "expires_estimated": "hatch_vml" not in cookies_exp,
+                "verification_state": (
+                    "verified" if authenticated else "pending_engine_verification"
+                ),
+                "session_verified_at": now_ts if authenticated else 0,
                 "user_agent": ua,
             }
 

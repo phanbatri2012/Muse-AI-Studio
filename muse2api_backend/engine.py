@@ -1197,17 +1197,26 @@ class MuseEngine:
                     dt.items.add(file);
                 }
                 var inputs = Array.from(document.querySelectorAll('input[type="file"]'));
-                if (!inputs.length) return JSON.stringify({ok: false, err: 'no-file-input'});
                 var ov = document.querySelector('[data-testid="hatch-composer-placeholder-overlay"]');
-                var composer = ov ? ov.closest('form') : null;
+                var composer = ov ? (ov.closest('form') || ov.parentElement.parentElement.parentElement) : null;
                 var input = null;
-                if (composer) {
+                if (composer && inputs.length) {
                     input = inputs.find(function(x){ return composer.contains(x); }) || null;
                 }
-                if (!input) {
+                if (!input && inputs.length) {
                     input = inputs.find(function(x){
                         return !x.closest('[class*=chat-user-bubble], [class*="group/msg"]');
                     }) || inputs[0];
+                }
+                if (!input) {
+                    var attachBtn = Array.from(document.querySelectorAll('button[aria-label]')).find(function(b){
+                        var al = b.getAttribute('aria-label') || '';
+                        return /attach|附加|上传|upload/i.test(al);
+                    });
+                    if (attachBtn) {
+                        attachBtn.click();
+                    }
+                    return JSON.stringify({ok: false, err: 'no-file-input'});
                 }
                 if (!input.getAttribute('accept')) input.setAttribute('accept', 'image/*');
                 input.files = dt.files;
@@ -1219,13 +1228,22 @@ class MuseEngine:
             }
         })(%s)
         """
-        try:
-            raw_res = self.page.js(_INJECT_JS % json.dumps(valid_files))
-            res_obj = json.loads(raw_res) if isinstance(raw_res, str) else raw_res
-            if not res_obj.get("ok"):
-                raise MuseGenerationError("附加参考图失败，已停止生成")
-        except Exception as e:
-            raise MuseGenerationError("附加参考图失败，已停止生成") from e
+        inject_deadline = time.time() + 5.0
+        last_inject_err = "no-file-input"
+        while time.time() < inject_deadline:
+            try:
+                raw_res = self.page.js(_INJECT_JS % json.dumps(valid_files))
+                res_obj = json.loads(raw_res) if isinstance(raw_res, str) else raw_res
+                if isinstance(res_obj, dict) and res_obj.get("ok"):
+                    break
+                if isinstance(res_obj, dict) and res_obj.get("err"):
+                    last_inject_err = str(res_obj.get("err"))
+            except Exception as e:
+                last_inject_err = str(e)
+            time.sleep(0.2)
+        else:
+            log.error("附加参考图超时/失败: %s", last_inject_err)
+            raise MuseGenerationError(f"附加参考图失败 ({last_inject_err})，已停止生成")
 
         # 等待输入框附件确认；历史图片不能证明本次上传成功。
         # 现网 UI 已切中文：确认按钮 aria-label = "附加文件"/"移除附件"；
