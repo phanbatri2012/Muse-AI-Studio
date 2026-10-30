@@ -23,6 +23,7 @@ Before implementing:
 - No "flexibility" or "configurability" that wasn't requested.
 - No error handling for impossible scenarios.
 - If you write 200 lines and it could be 50, rewrite it.
+- **No infinite or unbounded loops**: Every loop (`while`, worker polling, retry, queue processing) must have an explicit termination condition, maximum iteration bound (`max_iterations`), and timeout. Never block GUI event loops or background worker threads indefinitely.
 
 Ask yourself: "Would a senior engineer say this is overcomplicated?" If yes, simplify.
 

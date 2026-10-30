@@ -14,6 +14,7 @@ Keep this file aligned in intent with `AGENTS.md`. `AGENTS.md` remains part of t
 - Write the minimum code that solves the requested problem.
 - Do not add speculative abstractions, configuration, or edge-case handling that was not requested.
 - If a solution feels overbuilt, simplify it before shipping.
+- Avoid infinite loops: Enforce bounded iterations (max_iterations/retries) and explicit timeouts on all while loops, worker polling, and recovery routines.
 
 ## 3. Surgical Changes
 
