@@ -26,13 +26,18 @@ class CDP:
             self._id += 1
             mid = self._id
             self.ws.send(json.dumps({"id": mid, "method": method, "params": params or {}}))
+            closed_errors = tuple(filter(None, (getattr(websocket, "WebSocketConnectionClosedException", None), ConnectionResetError, BrokenPipeError)))
             deadline = time.time() + (timeout or self.timeout)
             while time.time() < deadline:
                 try:
-                    msg = json.loads(self.ws.recv())
+                    raw = self.ws.recv()
+                    msg = json.loads(raw)
                 except websocket.WebSocketTimeoutException:
                     continue
+                except closed_errors as exc:
+                    raise CDPError(f"WebSocket kết nối đã đóng khi gọi {method}: {exc}") from exc
                 except Exception:  # noqa: BLE001
+                    time.sleep(0.05)
                     continue
                 if msg.get("id") == mid:
                     if "error" in msg:
@@ -53,10 +58,17 @@ class CDP:
         """在 seconds 秒内持续读取事件，交给回调处理。"""
         end = time.time() + seconds
         self.ws.settimeout(sock_timeout)
+        closed_errors = tuple(filter(None, (getattr(websocket, "WebSocketConnectionClosedException", None), ConnectionResetError, BrokenPipeError)))
         while time.time() < end:
             try:
-                ev = json.loads(self.ws.recv())
+                raw = self.ws.recv()
+                ev = json.loads(raw)
+            except websocket.WebSocketTimeoutException:
+                continue
+            except closed_errors:
+                break
             except Exception:  # noqa: BLE001
+                time.sleep(0.05)
                 continue
             if on_event and "method" in ev:
                 on_event(ev)

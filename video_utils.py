@@ -86,11 +86,13 @@ def _safe_output_path(output_dir: str | Path, stem: str, suffix: str = ".mp4") -
     if not base.exists():
         return str(base)
     idx = 1
-    while True:
+    max_candidates = 10000
+    while idx <= max_candidates:
         candidate = out_dir / f"{stem}_{idx:03d}{suffix}"
         if not candidate.exists():
             return str(candidate)
         idx += 1
+    raise RuntimeError(f"Không tìm được tên file khả dụng sau {max_candidates} lần thử trong {out_dir}")
 
 
 def merge_videos(video_paths: list[str | Path], output_dir: str | Path, output_stem: str = "video_da_noi") -> str:

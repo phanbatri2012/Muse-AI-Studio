@@ -445,15 +445,27 @@ def safe_chat_stream(cookies: dict, prompt: str, expires: dict | None,
                 q.put(("error", last_exc))
         finally:
             if leased_id:
-                ACCOUNT_POOL.release(leased_id)
-            engine.close_current_page()
+                try:
+                    ACCOUNT_POOL.release(leased_id)
+                except Exception:
+                    pass
+            try:
+                engine.close_current_page()
+            except Exception:
+                pass
             q.put(("done", None))
 
-    threading.Thread(target=worker, daemon=True).start()
+    worker_thread = threading.Thread(target=worker, daemon=True)
+    worker_thread.start()
 
     try:
         while True:
-            kind, val = q.get()
+            try:
+                kind, val = q.get(timeout=1.0)
+            except queue.Empty:
+                if not worker_thread.is_alive():
+                    break
+                continue
             if kind == "data":
                 yield val
             elif kind == "error":

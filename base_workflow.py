@@ -119,8 +119,11 @@ class BaseWorkflow(QThread):
 
         return self._load_auth_credentials()
 
-    def _wait_for_in_flight_slot(self, delay_seconds: float = 1.0) -> None:
+    def _wait_for_in_flight_slot(self, delay_seconds: float = 1.0, timeout: float = 600.0) -> None:
+        deadline = time.time() + float(timeout)
         while not self._should_stop():
+            if time.time() >= deadline:
+                raise TimeoutError(f"Quá thời gian chờ slot trống ({timeout}s). Vui lòng thử lại sau.")
             running = get_running_video_count()
             limit = get_max_in_flight()
             if running < limit:
