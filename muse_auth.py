@@ -12,7 +12,7 @@ import struct
 import time
 from pathlib import Path
 from typing import Any, Callable
-from urllib.parse import parse_qs, urlsplit
+from urllib.parse import parse_qs, unquote, urlsplit
 try:
     from playwright.async_api import Browser, BrowserContext, Page, Playwright, async_playwright
 except ImportError:
@@ -48,6 +48,74 @@ def validate_tuan89_mailbox_url(email: str, mailbox_url: str) -> str:
     if mailbox_email.casefold() != email.strip().casefold():
         raise ValueError("Email trong link hộp thư không khớp tài khoản.")
     return "https://tuan89.site"
+
+
+def resolve_mailbox_service(email: str, mailbox_url: str) -> dict[str, Any]:
+    """Validate and resolve mailbox capability URL across providers (Tuan89, MrHulkStore, generic)."""
+    raw_url = mailbox_url.strip()
+    if "|otp?" in raw_url:
+        raw_url = raw_url.replace("|otp?", "/otp?")
+    if not raw_url.lower().startswith(("https://", "http://")):
+        raw_url = f"https://{raw_url}"
+
+    parsed = urlsplit(raw_url)
+    if parsed.scheme.lower() not in ("https", "http"):
+        raise ValueError("Link hộp thư phải sử dụng giao thức HTTPS hoặc HTTP.")
+    if parsed.username or parsed.password or parsed.port is not None:
+        raise ValueError("Link hộp thư không hợp lệ.")
+
+    hostname = (parsed.hostname or "").lower()
+    qs = parse_qs(parsed.query)
+    raw_mailbox_email = (qs.get("email") or qs.get("mail") or [""])[0].strip()
+    mailbox_email = unquote(raw_mailbox_email)
+
+    if mailbox_email and mailbox_email.casefold() != email.strip().casefold():
+        raise ValueError(
+            f"Email trong link hộp thư ({mailbox_email}) không khớp tài khoản ({email})."
+        )
+
+    # MrHulkStore provider
+    if "mrhulk" in hostname or "otp" in parsed.path.lower() or "sig" in qs:
+        sig = (qs.get("sig") or [""])[0].strip()
+        api_host = "api.mrhulkstore.store" if "mrhulkstore" in hostname else hostname
+        origin = f"{parsed.scheme}://{api_host}"
+        return {
+            "provider": "mrhulkstore",
+            "origin": origin,
+            "api_url": f"{origin}/api/v1/otp/fetch",
+            "email": email.strip(),
+            "sig": sig,
+        }
+
+    # Tuan89 provider
+    if "tuan89.site" in hostname or "temp-mail" in parsed.path.lower():
+        origin = f"{parsed.scheme}://{hostname}"
+        return {
+            "provider": "tuan89",
+            "origin": origin,
+            "api_url": f"{origin}/api/temp-mail/inbox",
+            "email": email.strip(),
+            "sig": None,
+        }
+
+    # Generic provider: check if sig is present
+    sig = (qs.get("sig") or [""])[0].strip()
+    origin = f"{parsed.scheme}://{hostname}"
+    if sig:
+        return {
+            "provider": "mrhulkstore",
+            "origin": origin,
+            "api_url": f"{origin}/api/v1/otp/fetch",
+            "email": email.strip(),
+            "sig": sig,
+        }
+    return {
+        "provider": "tuan89",
+        "origin": origin,
+        "api_url": f"{origin}/api/temp-mail/inbox",
+        "email": email.strip(),
+        "sig": None,
+    }
 
 
 from runtime_bootstrap import ensure_chrome_available, resolve_browser_executable
@@ -870,42 +938,93 @@ class MuseAuthManager:
             )
             page = await context.new_page()
 
-            mailbox_origin = ""
+            mailbox_service: dict[str, Any] | None = None
             baseline_message_ids: set[str] = set()
+            baseline_otp: str | None = None
             if mailbox_url:
-                mailbox_origin = validate_tuan89_mailbox_url(email, mailbox_url)
-                baseline_response = await context.request.get(
-                    f"{mailbox_origin}/api/temp-mail/inbox",
-                    params={"email": email},
-                    timeout=10000,
-                )
-                baseline_data = await baseline_response.json()
-                if not baseline_response.ok or not baseline_data.get("success"):
-                    raise RuntimeError("Không thể mở hộp thư nhận mã đăng nhập.")
-                baseline_message_ids = {
-                    str(item.get("id"))
-                    for item in baseline_data.get("messages", [])
-                    if item.get("id") is not None
-                }
+                mailbox_service = resolve_mailbox_service(email, mailbox_url)
+                if mailbox_service["provider"] == "tuan89":
+                    try:
+                        baseline_response = await context.request.get(
+                            mailbox_service["api_url"],
+                            params={"email": email},
+                            timeout=10000,
+                        )
+                        baseline_data = await baseline_response.json()
+                        if baseline_response.ok and baseline_data.get("success"):
+                            baseline_message_ids = {
+                                str(item.get("id"))
+                                for item in baseline_data.get("messages", [])
+                                if item.get("id") is not None
+                            }
+                    except Exception as exc:
+                        _log(f"⚠️ Kiểm tra hộp thư Tuan89 ban đầu: {exc}", log_callback)
+                elif mailbox_service["provider"] == "mrhulkstore":
+                    try:
+                        mrhulk_payload = {
+                            "email": email,
+                            "sig": mailbox_service["sig"] or "",
+                            "max_age_minutes": 15.0,
+                        }
+                        baseline_response = await context.request.post(
+                            mailbox_service["api_url"],
+                            data=json.dumps(mrhulk_payload),
+                            headers={"Content-Type": "application/json"},
+                            timeout=10000,
+                        )
+                        if baseline_response.status == 403:
+                            raise ValueError("Chữ ký (sig) hộp thư không hợp lệ hoặc đã hết hạn.")
+                        if baseline_response.ok:
+                            baseline_data = await baseline_response.json()
+                            if baseline_data.get("success") and baseline_data.get("found"):
+                                baseline_otp = str(baseline_data.get("otp_code") or "").strip()
+                    except ValueError:
+                        raise
+                    except Exception as exc:
+                        _log(f"⚠️ Kiểm tra ban đầu cổng OTP MrHulkStore: {exc}", log_callback)
 
             _log("🌐 Đang kết nối tới https://muse.ai/...", log_callback)
-            await page.goto("https://muse.ai/", wait_until="networkidle", timeout=30000)
+            await page.goto("https://muse.ai/", wait_until="domcontentloaded", timeout=30000)
             await asyncio.sleep(2.0)
 
             # 1. Điền email
             _log(f"📝 Điền email: {email}...", log_callback)
             email_input = page.locator("input[placeholder*='Mobile number or email']").first
-            if await email_input.count() == 0:
+            if await email_input.count() == 0 or not await email_input.is_visible():
                 email_input = page.locator("input[type='email'], input[type='text']").first
+
+            # Nếu chưa thấy ô nhập email, nhấn nút "Log in" / "Sign in" ở header/landing
+            if await email_input.count() == 0 or not await email_input.is_visible():
+                for signin_sel in [
+                    "button:has-text('Log in')", "button:has-text('Log In')",
+                    "button:has-text('Sign In')", "a[href*='login']", "button[data-slot='button']:has-text('Log in')"
+                ]:
+                    try:
+                        btn = page.locator(signin_sel).first
+                        if await btn.count() > 0 and await btn.is_visible():
+                            _log("🖱️ Nhấn nút 'Log in' ở giao diện...", log_callback)
+                            await btn.click()
+                            await asyncio.sleep(2.0)
+                            break
+                    except Exception:
+                        continue
+                # Tìm lại ô email
+                email_input = page.locator("input[placeholder*='Mobile number or email']").first
+                if await email_input.count() == 0 or not await email_input.is_visible():
+                    email_input = page.locator("input[type='email'], input[type='text']").first
+
             await email_input.fill(email)
             await asyncio.sleep(1.0)
 
-            cont_btn = page.locator("button:has-text('Continue')").first
+            cont_btn = page.locator("button:has-text('Continue'), button[type='submit']").first
             _log("🖱️ Nhấn Tiếp tục (Continue)...", log_callback)
-            await cont_btn.click()
+            if await cont_btn.count() > 0 and await cont_btn.is_visible():
+                await cont_btn.click()
+            else:
+                await email_input.press("Enter")
             await asyncio.sleep(3.5)
 
-            if mailbox_url:
+            if mailbox_url and mailbox_service:
                 _log("📨 Đang chờ mã đăng nhập mới từ hộp thư...", log_callback)
                 code_input = page.locator(
                     "input[autocomplete='one-time-code'], input[placeholder*='code' i], "
@@ -914,27 +1033,63 @@ class MuseAuthManager:
                 await code_input.wait_for(state="visible", timeout=15000)
                 mailbox_deadline = time.time() + float(timeout_seconds)
                 mailbox_code = ""
-                while time.time() < mailbox_deadline and not mailbox_code:
-                    response = await context.request.get(
-                        f"{mailbox_origin}/api/temp-mail/inbox",
-                        params={"email": email},
-                        timeout=10000,
-                    )
-                    data = await response.json()
-                    if response.ok and data.get("success"):
-                        for item in data.get("messages", []):
-                            message_id = str(item.get("id"))
-                            otp_code = str(item.get("otp_code") or "").strip()
-                            if (
-                                message_id not in baseline_message_ids
-                                and re.fullmatch(r"\d{4,8}", otp_code)
-                            ):
-                                mailbox_code = otp_code
-                                break
+                max_iterations = max(10, int(timeout_seconds / 2.0))
+                iteration = 0
+
+                while time.time() < mailbox_deadline and not mailbox_code and iteration < max_iterations:
+                    iteration += 1
+                    try:
+                        if mailbox_service["provider"] == "tuan89":
+                            response = await context.request.get(
+                                mailbox_service["api_url"],
+                                params={"email": email},
+                                timeout=10000,
+                            )
+                            data = await response.json()
+                            if response.ok and data.get("success"):
+                                for item in data.get("messages", []):
+                                    message_id = str(item.get("id"))
+                                    otp_code = str(item.get("otp_code") or "").strip()
+                                    if (
+                                        message_id not in baseline_message_ids
+                                        and re.fullmatch(r"\d{4,8}", otp_code)
+                                    ):
+                                        mailbox_code = otp_code
+                                        break
+                        elif mailbox_service["provider"] == "mrhulkstore":
+                            payload = {
+                                "email": email,
+                                "sig": mailbox_service["sig"] or "",
+                                "max_age_minutes": 15.0,
+                            }
+                            if baseline_otp:
+                                payload["exclude_otp"] = baseline_otp
+                            response = await context.request.post(
+                                mailbox_service["api_url"],
+                                data=json.dumps(payload),
+                                headers={"Content-Type": "application/json"},
+                                timeout=10000,
+                            )
+                            if response.status == 403:
+                                raise ValueError("Chữ ký (sig) hộp thư không hợp lệ hoặc đã hết hạn.")
+                            if response.ok:
+                                data = await response.json()
+                                if data.get("success") and data.get("found"):
+                                    cand_otp = str(data.get("otp_code") or "").strip()
+                                    if re.fullmatch(r"\d{4,8}", cand_otp):
+                                        mailbox_code = cand_otp
+                                        break
+                    except ValueError:
+                        raise
+                    except Exception as exc:
+                        _log(f"⚠️ Đang chờ mã OTP từ hộp thư: {exc}", log_callback)
+
                     if not mailbox_code:
-                        await asyncio.sleep(2.0)
+                        await asyncio.sleep(2.5)
+
                 if not mailbox_code:
                     raise TimeoutError("Không nhận được mã đăng nhập mới từ hộp thư.")
+                _log(f"🔢 Đã nhận mã OTP: {mailbox_code}. Đang điền mã...", log_callback)
                 await code_input.fill(mailbox_code)
                 submit_code = page.locator(
                     "button:has-text('Next'), button:has-text('Continue'), "

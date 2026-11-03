@@ -41,6 +41,8 @@ from PyQt6.QtWidgets import (
     QWidget,
 )
 
+from urllib.parse import parse_qs, unquote, urlsplit
+
 from branding_config import TELEGRAM_BOT_URL
 from muse_auth import MuseAuthManager
 from muse_service_manager import (
@@ -54,11 +56,43 @@ from muse_api_client import MuseAPIClient
 _MARKDOWN_LINK_RE = re.compile(r"^\[[^\]]*\]\((https?://[^)]+)\)$", re.IGNORECASE)
 
 
+def _normalize_mailbox_url(raw_url: str) -> str:
+    url = raw_url.strip()
+    match = _MARKDOWN_LINK_RE.fullmatch(url)
+    if match:
+        url = match.group(1).strip()
+
+    if "|otp?" in url:
+        url = url.replace("|otp?", "/otp?")
+
+    if not url.lower().startswith(("https://", "http://")):
+        url = f"https://{url}"
+
+    parsed = urlsplit(url)
+    hostname = (parsed.hostname or "").lower()
+
+    if hostname == "mrhulkstore.store":
+        url = url.replace("mrhulkstore.store", "api.mrhulkstore.store", 1)
+
+    return url
+
+
 def parse_account_login_line(line: str) -> tuple[str, str, str, str]:
-    """Parse legacy password credentials or an email mailbox link."""
+    """Parse legacy password credentials, an email mailbox link, or standalone mailbox URL."""
     value = line.strip()
     if not value:
         raise ValueError("Dòng tài khoản trống.")
+
+    lowered = value.lower()
+    # Hỗ trợ trường hợp người dùng dán trực tiếp link hộp thư (có chứa mail= hoặc email=)
+    if ("otp?" in lowered or "/mail/" in lowered or "sig=" in lowered) and not ("@" in value and ("|" in value or "\t" in value or "," in value)):
+        norm_url = _normalize_mailbox_url(value)
+        parsed = urlsplit(norm_url)
+        qs = parse_qs(parsed.query)
+        extracted_email = (qs.get("mail") or qs.get("email") or [""])[0].strip()
+        extracted_email = unquote(extracted_email)
+        if extracted_email and "@" in extracted_email:
+            return extracted_email, "", "", norm_url
 
     if "|" in value:
         parts = [part.strip() for part in value.split("|")]
@@ -66,18 +100,36 @@ def parse_account_login_line(line: str) -> tuple[str, str, str, str]:
         parts = [part.strip() for part in value.split("\t")]
     else:
         parts = [part.strip() for part in value.split(",")]
-    if len(parts) < 2 or not parts[0] or not parts[1]:
+
+    if not parts or not parts[0]:
         raise ValueError("Cần nhập email và mật khẩu hoặc link hộp thư.")
 
     email = parts[0]
-    second = parts[1]
-    markdown_match = _MARKDOWN_LINK_RE.fullmatch(second)
-    mailbox_url = markdown_match.group(1) if markdown_match else second
-    if mailbox_url.lower().startswith(("https://", "http://")):
-        return email, "", "", mailbox_url
 
-    two_factor_secret = parts[2] if len(parts) >= 3 else ""
-    return email, second, two_factor_secret, ""
+    # Hỗ trợ trường hợp link bị chia cắt bởi dấu | (ví dụ: email | mrhulkstore.store | otp?mail=... hoặc email | domain | path)
+    if len(parts) >= 3:
+        second = parts[1]
+        third = parts[2]
+        if third.lower().startswith(("otp?", "?", "sig=")) or "mail=" in third.lower() or "email=" in third.lower():
+            combined_url = f"{second}/{third}" if not second.endswith("/") and not third.startswith("/") else f"{second}{third}"
+            norm_url = _normalize_mailbox_url(combined_url)
+            return email, "", "", norm_url
+        return email, second, third, ""
+
+    if len(parts) == 2:
+        second = parts[1]
+        norm_url = _normalize_mailbox_url(second)
+        lowered_second = second.lower()
+        if (
+            norm_url.lower().startswith(("https://", "http://"))
+            and any(kw in lowered_second for kw in ["tuan89", "mrhulk", "otp?", "/mail/", "sig=", "inbox", "temp-mail"])
+        ):
+            return email, "", "", norm_url
+        if second.lower().startswith(("https://", "http://")):
+            return email, "", "", second
+        return email, second, "", ""
+
+    raise ValueError("Cần nhập email và mật khẩu hoặc link hộp thư.")
 
 
 class BatchLoginWorker(QThread):
@@ -397,7 +449,7 @@ class AccountsManagerTab(QWidget):
         # Hướng dẫn nhanh cho người dùng non-tech
         lbl_hint = QLabel(
             "💡 <b>Dạng 1:</b> <code>email | mật_khẩu | mã_2fa</code><br>"
-            "💡 <b>Dạng 2:</b> <code>email | link_hộp_thư</code>"
+            "💡 <b>Dạng 2:</b> <code>email | link_hộp_thư</code> (Tuan89, HulkStore, hoặc dán trực tiếp link OTP)"
         )
         lbl_hint.setStyleSheet("color: #94a3b8; font-size: 11px;")
         left_layout.addWidget(lbl_hint)
@@ -408,6 +460,7 @@ class AccountsManagerTab(QWidget):
             "Dán danh sách tài khoản tại đây, mỗi dòng một tài khoản:\n\n"
             "user1@example.com|Password123|JBSWY3DPEHPK3PXP\n"
             "user2@tuan89.site|https://tuan89.site/mail/?email=user2%40tuan89.site\n"
+            "user3@domain.com|https://api.mrhulkstore.store/otp?mail=user3%40domain.com&sig=...\n"
         )
         self.txt_accounts_input.setLineWrapMode(QPlainTextEdit.LineWrapMode.NoWrap)
         font = QFont("Consolas", 11)

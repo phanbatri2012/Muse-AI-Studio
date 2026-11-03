@@ -2207,7 +2207,7 @@ async def relogin_account(
             raise HTTPException(400, "Không gửi link hộp thư khi dùng mật khẩu.", headers=no_store)
     else:
         if not mailbox_url:
-            raise HTTPException(400, "Cần nhập link hộp thư Tuan89.", headers=no_store)
+            raise HTTPException(400, "Cần nhập link hộp thư.", headers=no_store)
         if password or two_factor_secret:
             raise HTTPException(400, "Không gửi mật khẩu hoặc 2FA khi dùng hộp thư.", headers=no_store)
 

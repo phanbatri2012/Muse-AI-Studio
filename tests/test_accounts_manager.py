@@ -78,6 +78,35 @@ def test_parse_account_login_line_unwraps_markdown_mailbox_url():
     )
 
 
+def test_parse_account_login_line_supports_mrhulkstore_and_pipe_splitting():
+    # 2 parts with https
+    line1 = "user@domain.com|https://api.mrhulkstore.store/otp?mail=user%40domain.com&sig=7abcdef"
+    assert parse_account_login_line(line1) == (
+        "user@domain.com",
+        "",
+        "",
+        "https://api.mrhulkstore.store/otp?mail=user%40domain.com&sig=7abcdef",
+    )
+
+    # 3 parts split: email | domain | query
+    line2 = "user@domain.com|mrhulkstore.store|otp?mail=user%40domain.com&sig=7abcdef"
+    assert parse_account_login_line(line2) == (
+        "user@domain.com",
+        "",
+        "",
+        "https://api.mrhulkstore.store/otp?mail=user%40domain.com&sig=7abcdef",
+    )
+
+    # Standalone URL without explicit email column
+    line3 = "https://api.mrhulkstore.store/otp?mail=user%40domain.com&sig=7abcdef"
+    assert parse_account_login_line(line3) == (
+        "user@domain.com",
+        "",
+        "",
+        "https://api.mrhulkstore.store/otp?mail=user%40domain.com&sig=7abcdef",
+    )
+
+
 def test_batch_login_persists_verified_session_metadata(tmp_path):
     accounts_path = tmp_path / "accounts.json"
     accounts_path.write_text(
