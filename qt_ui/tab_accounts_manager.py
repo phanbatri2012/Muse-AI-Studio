@@ -139,9 +139,10 @@ class BatchLoginWorker(QThread):
     finished_signal = pyqtSignal(int, int)  # success_count, fail_count
     log_signal = pyqtSignal(str)
 
-    def __init__(self, account_lines: List[str], parent: QWidget | None = None) -> None:
+    def __init__(self, account_lines: List[str], headless: bool = True, parent: QWidget | None = None) -> None:
         super().__init__(parent)
         self.account_lines = account_lines
+        self.headless = headless
         self._is_cancelled = False
 
     def cancel(self) -> None:
@@ -180,8 +181,9 @@ class BatchLoginWorker(QThread):
                         password=password,
                         two_factor_secret=two_fa,
                         mailbox_url=mailbox_url or None,
-                        timeout_seconds=60,
+                        timeout_seconds=60 if self.headless else 180,
                         log_callback=self.log_signal.emit,
+                        headless=self.headless,
                     )
                 )
 
@@ -480,6 +482,13 @@ class AccountsManagerTab(QWidget):
         self.btn_clear_input.clicked.connect(self.txt_accounts_input.clear)
         tb_layout.addWidget(self.btn_clear_input)
         left_layout.addLayout(tb_layout)
+
+        # Tùy chọn hiển thị trình duyệt để hỗ trợ giải Captcha nếu Meta yêu cầu
+        self.chk_show_browser = QCheckBox("Hiện trình duyệt khi đăng nhập (khuyên dùng khi Meta yêu cầu Captcha)")
+        self.chk_show_browser.setChecked(True)
+        self.chk_show_browser.setStyleSheet("color: #cbd5e1; font-size: 11px;")
+        self.chk_show_browser.setToolTip("Mở cửa sổ Chrome thay vì chạy ngầm, cho phép bạn quan sát và tự giải đố hình ảnh reCAPTCHA khi Meta checkpoint tài khoản.")
+        left_layout.addWidget(self.chk_show_browser)
 
         # Thanh tiến độ đăng nhập
         self.progress_bar = QProgressBar()
@@ -931,7 +940,8 @@ class AccountsManagerTab(QWidget):
         self.lbl_progress_status.setVisible(True)
         self.lbl_progress_status.setText("Đang khởi động tiến trình đăng nhập tự động...")
 
-        self._login_worker = BatchLoginWorker(lines)
+        show_browser = getattr(self, "chk_show_browser", None) is not None and self.chk_show_browser.isChecked()
+        self._login_worker = BatchLoginWorker(lines, headless=not show_browser)
         self._login_worker.log_signal.connect(self._log)
         self._login_worker.progress_signal.connect(self._on_login_progress)
         self._login_worker.finished_signal.connect(self._on_login_finished)

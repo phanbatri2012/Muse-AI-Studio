@@ -896,14 +896,16 @@ class MuseAuthManager:
         mailbox_url: str | None = None,
         timeout_seconds: int = 60,
         log_callback: Callable[[str], None] | None = None,
+        headless: bool = True,
     ) -> dict[str, Any]:
         """Tự động đăng nhập vào Muse AI hoàn toàn độc lập (Headless Playwright) và trả về cookies.
         Hỗ trợ:
         - Nhập Email và nhấn Tiếp tục
         - Chọn 'Use password instead' và nhập Mật khẩu
-        - Hoặc nhận mã đăng nhập từ link hộp thư Tuan89
+        - Hoặc nhận mã đăng nhập từ link hộp thư Tuan89 / MrHulkStore
         - Tự động chọn hồ sơ Meta Account đầu tiên nếu xuất hiện màn hình chọn hồ sơ
         - Tự động vượt qua 2FA TOTP với secret key Base32
+        - Tự động nhận diện và xử lý Checkpoint Meta / reCAPTCHA 'Confirm you are human'
         - Chờ cấp phát session cookies (hatch_sess, hatch_vml, hatch_gw)
         """
         if async_playwright is None:
@@ -920,22 +922,30 @@ class MuseAuthManager:
                 _log("🔍 Đang kiểm tra/chuẩn bị trình duyệt Chromium...", log_callback)
                 browser_exe = ensure_chrome_available(progress_callback=log_callback)
 
-            launch_kwargs = {
-                "headless": True,
+            launch_kwargs: dict[str, Any] = {
+                "headless": headless,
                 "args": [
                     "--disable-blink-features=AutomationControlled",
                     "--no-sandbox",
                     "--disable-dev-shm-usage",
                 ],
             }
+            if not headless:
+                launch_kwargs["args"].extend(["--disable-infobars", "--start-maximized"])
             if browser_exe and os.path.isfile(browser_exe):
                 launch_kwargs["executable_path"] = browser_exe
 
             browser = await playwright.chromium.launch(**launch_kwargs)
-            context = await browser.new_context(
-                user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/133.0.0.0 Safari/537.36",
-                viewport={"width": 1280, "height": 800},
-            )
+            context_kwargs: dict[str, Any] = {
+                "user_agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/133.0.0.0 Safari/537.36",
+            }
+            if headless:
+                context_kwargs["viewport"] = {"width": 1280, "height": 800}
+            else:
+                context_kwargs["viewport"] = None
+
+            context = await browser.new_context(**context_kwargs)
+            await context.add_init_script("delete Object.getPrototypeOf(navigator).webdriver")
             page = await context.new_page()
 
             mailbox_service: dict[str, Any] | None = None
@@ -1158,7 +1168,7 @@ class MuseAuthManager:
                     sub_2fa = page.locator("button:has-text('Next'), button:has-text('Continue'), button:has-text('Confirm'), button[type='submit']").first
                     await sub_2fa.click()
 
-            # 7. Chờ cấp session cookies
+            # 7. Chờ cấp session cookies & xử lý checkpoint Meta
             _log("⏳ Chờ Meta xác thực và cấp session cookies...", log_callback)
             deadline = time.time() + float(timeout_seconds)
             cookies = []
@@ -1172,12 +1182,112 @@ class MuseAuthManager:
             verification_navigation_attempted = False
             account_selection_handled = False
             post_login_confirmation_handled = False
+            checkpoint_continue_clicked_at = 0.0
+            last_recaptcha_click_at = 0.0
+            meta_checkpoint_detected = False
 
             while time.time() < deadline:
                 await asyncio.sleep(2.0)
+                try:
+                    cur_url = page.url.lower()
+                except Exception:
+                    cur_url = ""
+
                 cookies = await context.cookies()
                 cookie_dict = {c["name"]: c["value"] for c in cookies}
                 bootstrap_cookie_present = has_muse_session_bootstrap(cookie_dict)
+                complete_session_present = has_complete_muse_session(cookie_dict)
+
+                is_meta_domain = any(domain in cur_url for domain in ["auth.meta.com", "facebook.com", "instagram.com"])
+                is_checkpoint = "checkpoint" in cur_url or "checkpoints" in cur_url
+                if is_meta_domain or is_checkpoint:
+                    meta_checkpoint_detected = True
+
+                # 7.1. Xử lý màn hình Checkpoint / reCAPTCHA của Meta
+                if is_meta_domain or is_checkpoint:
+                    # Kiểm tra xem tài khoản có bị Meta khóa checkpoint Selfie / ID không
+                    try:
+                        selfie_prompt = page.locator(
+                            "text='Upload a verification selfie', button:has-text('Upload image'), "
+                            "button:has-text('Take selfie'), text='Confirm your identity'"
+                        ).first
+                        if await selfie_prompt.count() > 0 and await selfie_prompt.is_visible():
+                            _log("❌ Tài khoản bị Meta khóa (Yêu cầu xác minh selfie / khuôn mặt)!", log_callback)
+                            return {
+                                "success": False,
+                                "error_code": "meta_account_locked_selfie",
+                                "error": "Tài khoản bị Meta khóa bảo mật (Yêu cầu Upload a verification selfie). Không thể đăng nhập.",
+                                "email": email,
+                            }
+                    except Exception:
+                        pass
+
+                    # Kiểm tra và nhấp vào checkbox reCAPTCHA Enterprise nếu có trong iframe
+                    try:
+                        for frame in page.frames:
+                            if "recaptcha" in frame.url and "anchor" in frame.url:
+                                recaptcha_box = frame.locator("#recaptcha-anchor, .recaptcha-checkbox").first
+                                if await recaptcha_box.count() > 0 and await recaptcha_box.is_visible():
+                                    aria_checked = await recaptcha_box.get_attribute("aria-checked")
+                                    if aria_checked != "true":
+                                        now_rc = time.time()
+                                        if now_rc - last_recaptcha_click_at >= 4.0:
+                                            last_recaptcha_click_at = now_rc
+                                            _log("🛡️ Phát hiện màn hình 'Confirm you are human' -> Nhấp xác thực reCAPTCHA...", log_callback)
+                                            await recaptcha_box.click(timeout=3000)
+                                            await asyncio.sleep(2.0)
+                                            break
+                    except Exception:
+                        pass
+
+                    # Kiểm tra câu đố hình ảnh reCAPTCHA
+                    try:
+                        has_image_puzzle = False
+                        for frame in page.frames:
+                            if "recaptcha" in frame.url and ("bframe" in frame.url or "userverify" in frame.url):
+                                img_sel = frame.locator("#rc-imageselect, .rc-imageselect-payload").first
+                                if await img_sel.count() > 0 and await img_sel.is_visible():
+                                    has_image_puzzle = True
+                                    break
+                        if has_image_puzzle:
+                            if headless:
+                                _log("⚠️ Meta yêu cầu giải hình ảnh reCAPTCHA Enterprise. Trình duyệt đang chạy ngầm nên không thể click chọn hình ảnh.", log_callback)
+                                _log("💡 Hãy bật tùy chọn 'Hiện trình duyệt khi đăng nhập' trên giao diện để tự giải câu đố!", log_callback)
+                                return {
+                                    "success": False,
+                                    "error_code": "meta_recaptcha_puzzle_headless",
+                                    "error": "Meta yêu cầu giải reCAPTCHA hình ảnh. Hãy bật tùy chọn 'Hiện trình duyệt khi đăng nhập' để đăng nhập thành công.",
+                                    "email": email,
+                                }
+                            else:
+                                _log("🧩 Meta yêu cầu giải câu đố hình ảnh reCAPTCHA -> Vui lòng bấm chọn hình ảnh trên cửa sổ Chrome...", log_callback)
+                    except Exception:
+                        pass
+
+                    # Nhấp nút Continue / Tiếp tục trên màn hình Checkpoint khi nút khả dụng
+                    try:
+                        checkpoint_btn = page.locator(
+                            "button:has-text('Continue'), div[role='button']:has-text('Continue'), "
+                            "button:has-text('Tiếp tục'), button:has-text('Next')"
+                        ).first
+                        if (
+                            await checkpoint_btn.count() > 0
+                            and await checkpoint_btn.is_visible()
+                        ):
+                            aria_dis = await checkpoint_btn.get_attribute("aria-disabled")
+                            dis = await checkpoint_btn.get_attribute("disabled")
+                            if aria_dis != "true" and dis != "true":
+                                now_clk = time.time()
+                                if now_clk - checkpoint_continue_clicked_at >= 4.0:
+                                    checkpoint_continue_clicked_at = now_clk
+                                    _log("➡️ Đang nhấn 'Tiếp tục' (Continue) trên màn hình checkpoint Meta...", log_callback)
+                                    await checkpoint_btn.click(timeout=5000)
+                                    await asyncio.sleep(2.5)
+                                    continue
+                    except Exception:
+                        pass
+
+                # 7.2. Cập nhật trạng thái bootstrap cookie
                 if bootstrap_cookie_present:
                     if not bootstrap_cookie_seen:
                         bootstrap_cookie_seen_at = time.time()
@@ -1185,11 +1295,14 @@ class MuseAuthManager:
                     bootstrap_cookie_last_seen_at = time.time()
                 elif (
                     bootstrap_cookie_seen
-                    and time.time() - bootstrap_cookie_last_seen_at >= 6.0
+                    and not is_meta_domain
+                    and not is_checkpoint
+                    and time.time() - bootstrap_cookie_last_seen_at >= 20.0
                 ):
                     bootstrap_cookie_revoked = True
                     break
-                if not bootstrap_cookie_seen:
+
+                if not bootstrap_cookie_seen and not is_checkpoint and not is_meta_domain:
                     delayed_account = page.locator(
                         "button[data-pel-click='login_account_selection_row_click'], "
                         "button[data-pel-click*='account_selection']"
@@ -1235,39 +1348,51 @@ class MuseAuthManager:
                         )
                         await delayed_confirmation.click(timeout=5000)
                         continue
-                if bootstrap_cookie_seen and not verification_navigation_attempted:
-                    verification_navigation_attempted = True
-                    _log(
-                        "🔄 Đã nhận cookie bootstrap; đang mở workspace Muse...",
-                        log_callback,
-                    )
-                    try:
-                        await page.goto(
-                            "https://muse.ai/thread/new",
-                            wait_until="domcontentloaded",
-                            timeout=15000,
-                        )
-                    except Exception:
-                        # The next poll determines readiness from cookies and DOM.
-                        pass
-                    continue
+
                 if not bootstrap_cookie_seen:
                     continue
                 if not bootstrap_cookie_present:
                     continue
 
-                auth_state = await cls.check_authentication(page)
-                if auth_state.get("authenticated"):
-                    authenticated = True
-                    _log("🎉 Phiên Muse đã được xác minh thành công!", log_callback)
-                    break
-                if time.time() - bootstrap_cookie_seen_at >= 15.0:
-                    verification_deferred = True
-                    _log(
-                        "🔎 Đã nhận session bootstrap; chuyển sang verifier engine...",
-                        log_callback,
-                    )
-                    break
+                # 7.3. Xác thực trạng thái hoàn tất phiên (chỉ khi có đủ bộ cookie hoàn chỉnh)
+                if complete_session_present and not is_meta_domain and not is_checkpoint:
+                    auth_state = await cls.check_authentication(page)
+                    if auth_state.get("authenticated"):
+                        authenticated = True
+                        _log("🎉 Phiên Muse đã được xác minh thành công!", log_callback)
+                        break
+                    if not verification_navigation_attempted:
+                        verification_navigation_attempted = True
+                        _log("🔄 Đã nhận session cookies hoàn chỉnh; đang mở workspace Muse...", log_callback)
+                        try:
+                            await page.goto(
+                                "https://muse.ai/thread/new",
+                                wait_until="domcontentloaded",
+                                timeout=15000,
+                            )
+                        except Exception:
+                            pass
+                        continue
+                    if time.time() - bootstrap_cookie_seen_at >= 15.0:
+                        verification_deferred = True
+                        _log(
+                            "🔎 Đã nhận session cookies đầy đủ; chuyển sang verifier engine...",
+                            log_callback,
+                        )
+                        break
+                elif not is_meta_domain and not is_checkpoint:
+                    auth_state = await cls.check_authentication(page)
+                    if auth_state.get("authenticated"):
+                        authenticated = True
+                        _log("🎉 Phiên Muse đã được xác minh thành công!", log_callback)
+                        break
+                    if time.time() - bootstrap_cookie_seen_at >= 15.0:
+                        verification_deferred = True
+                        _log(
+                            "🔎 Đã nhận session bootstrap; chuyển sang verifier engine...",
+                            log_callback,
+                        )
+                        break
 
             if not authenticated:
                 if bootstrap_cookie_revoked:
@@ -1280,6 +1405,14 @@ class MuseAuthManager:
                     }
                 if bootstrap_cookie_seen and not verification_deferred:
                     verification_deferred = True
+                if (is_meta_domain or is_checkpoint or meta_checkpoint_detected) and not verification_deferred:
+                    _log("❌ Meta yêu cầu xác minh người dùng (reCAPTCHA Enterprise)", log_callback)
+                    return {
+                        "success": False,
+                        "error_code": "meta_security_checkpoint_required",
+                        "error": "Meta yêu cầu giải câu đố reCAPTCHA. Hãy bật tùy chọn 'Hiện trình duyệt' để tự giải nếu cần.",
+                        "email": email,
+                    }
                 if mailbox_url and not verification_deferred:
                     pending_code_input = page.locator(
                         "input[autocomplete='one-time-code'], "

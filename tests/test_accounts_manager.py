@@ -142,3 +142,18 @@ def test_batch_login_persists_verified_session_metadata(tmp_path):
     assert account["session_verified_at"] == 1_900_000_000
     assert account["verification_state"] == "verified"
     assert account["expires_estimated"] is False
+
+
+def test_accounts_tab_has_show_browser_option(qapp):
+    tab = AccountsManagerTab()
+    assert hasattr(tab, "chk_show_browser")
+    assert tab.chk_show_browser is not None
+    assert tab.chk_show_browser.isChecked() is True
+
+
+def test_batch_login_worker_headless_flag():
+    worker_default = BatchLoginWorker(["test@example.com|pass|2fa"])
+    assert worker_default.headless is True
+
+    worker_headed = BatchLoginWorker(["test@example.com|pass|2fa"], headless=False)
+    assert worker_headed.headless is False
