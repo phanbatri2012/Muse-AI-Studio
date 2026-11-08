@@ -54,7 +54,14 @@ class ShortsTTSEngine:
                 return
             except Exception:
                 pass
-        print(f"[SHORTS_TTS] {msg}")
+        try:
+            print(f"[SHORTS_TTS] {msg}")
+        except Exception:
+            try:
+                safe = msg.encode("ascii", errors="replace").decode("ascii")
+                print(f"[SHORTS_TTS] {safe}")
+            except Exception:
+                pass
 
     def generate_speech(
         self,
